@@ -12,6 +12,7 @@ tmdsimpy.nlforces :
 from .elastic_dry_fric_2d import ElasticDryFriction2D
 from .jenkins_element import JenkinsForce
 from .roughcontact.rough_contact import RoughContactFriction
+from .roughcontact.manifold import ManifoldFriction
 from .vector_jenkins import VectorJenkins
 
 # Explicit modifications to '__all__'
@@ -20,6 +21,7 @@ from .vector_jenkins import VectorJenkins
 add_to_all = ['ElasticDryFriction2D',
               'JenkinsForce',
               'RoughContactFriction',
+              'ManifoldFriction',
               'VectorJenkins']
 
 # files that have imported contents here, so should not be in __all__
