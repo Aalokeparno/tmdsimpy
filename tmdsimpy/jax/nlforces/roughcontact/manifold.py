@@ -2,7 +2,7 @@
 
 The static force and history behavior are inherited unchanged from
 ``RoughContactFriction``.  Only the local steady-periodic force history used
-by AFT is replaced by the fitted normal-GP and tangential-NN models.
+by AFT is replaced by the fitted normal-GP and tangential-KNN models.
 """
 
 from functools import partial
@@ -31,28 +31,26 @@ _NORMAL_REQUIRED_KEYS = (
     "cutoff_u_min",
 )
 
-_NN_LAYER_SIZES = (2, 128, 128, 128, 128, 1)
+_TANGENTIAL_DISPLACEMENT_AMPLITUDE = 1.0e-5
+"""Tangential-displacement offset used to break trajectory symmetry.
+
+This matches ``utamp`` in ``manifolds/rough_contact/mainb.py`` and
+``manifolds/rough_contact/main_knn.py``. Unlike the older neural-network
+surface archives, the fitted KNN surface archives do not store this value,
+so it is hard-coded here rather than read from the tangential-model file.
+"""
+
 _TANGENTIAL_REQUIRED_KEYS = (
-    "format_version",
-    "model_type",
-    "precision",
-    "target_mode",
-    "input_feature_order",
-    "output_definition",
-    "layer_sizes",
-    "activation_name",
-    "weight_convention",
-    "layer_count",
-    "s_U",
-    "s_Fn",
-    "s_Ft",
-    "U_transformed_mean",
-    "U_transformed_std",
-    "Fn_transformed_mean",
-    "Fn_transformed_std",
-    "target_mean",
-    "target_std",
-    "utamp",
+    "X_train",
+    "Z_train",
+    "n_neighbors",
+    "distance_weighted",
+    "xy_mean",
+    "xy_scale",
+    "z_mean",
+    "z_scale",
+    "scale_u",
+    "scale_F",
 )
 
 
@@ -71,22 +69,81 @@ class NormalGPParameters(NamedTuple):
     cutoff_u_min: jax.Array
 
 
-class TangentialNNParameters(NamedTuple):
-    """Numerical tangential-NN parameters passed through JAX as a pytree."""
+class TangentialNNParameters:
+    """Numerical tangential-KNN parameters passed through JAX as a pytree.
 
-    s_u: jax.Array
-    s_fn: jax.Array
-    s_ft: jax.Array
-    u_mean: jax.Array
-    u_std: jax.Array
-    fn_mean: jax.Array
-    fn_std: jax.Array
-    target_mean: jax.Array
-    target_std: jax.Array
-    target_is_asinh: jax.Array
-    utamp: jax.Array
-    weights: tuple
-    biases: tuple
+    ``n_neighbors`` and ``distance_weighted`` are kept as static auxiliary
+    pytree data rather than array leaves: ``jax.lax.top_k`` requires ``k`` to
+    be a concrete Python integer and the distance-weighting branch is a
+    Python-level ``if``, so both must stay outside of JAX tracing.
+    """
+
+    __slots__ = (
+        "x_train",
+        "z_train",
+        "xy_mean",
+        "xy_scale",
+        "z_mean",
+        "z_scale",
+        "scale_u",
+        "scale_F",
+        "utamp",
+        "n_neighbors",
+        "distance_weighted",
+    )
+
+    def __init__(
+        self,
+        x_train,
+        z_train,
+        xy_mean,
+        xy_scale,
+        z_mean,
+        z_scale,
+        scale_u,
+        scale_F,
+        utamp,
+        n_neighbors,
+        distance_weighted,
+    ):
+        self.x_train = x_train
+        self.z_train = z_train
+        self.xy_mean = xy_mean
+        self.xy_scale = xy_scale
+        self.z_mean = z_mean
+        self.z_scale = z_scale
+        self.scale_u = scale_u
+        self.scale_F = scale_F
+        self.utamp = utamp
+        self.n_neighbors = n_neighbors
+        self.distance_weighted = distance_weighted
+
+    def _tree_flatten(self):
+        children = (
+            self.x_train,
+            self.z_train,
+            self.xy_mean,
+            self.xy_scale,
+            self.z_mean,
+            self.z_scale,
+            self.scale_u,
+            self.scale_F,
+            self.utamp,
+        )
+        aux_data = (self.n_neighbors, self.distance_weighted)
+        return children, aux_data
+
+    @classmethod
+    def _tree_unflatten(cls, aux_data, children):
+        n_neighbors, distance_weighted = aux_data
+        return cls(*children, n_neighbors, distance_weighted)
+
+
+jax.tree_util.register_pytree_node(
+    TangentialNNParameters,
+    TangentialNNParameters._tree_flatten,
+    TangentialNNParameters._tree_unflatten,
+)
 
 
 def _load_mapping(model, model_name):
@@ -231,116 +288,66 @@ def load_normal_model(model):
 
 
 def load_tangential_model(model):
-    """Validate and convert tangential-NN inference parameters to JAX arrays."""
+    """Validate and convert tangential-KNN inference parameters to JAX arrays.
+
+    Mirrors the archive format written by
+    ``manifolds/rough_contact/tangential_load_prediction_knn.py``
+    (``KNNFitter.save_knn_params``) and consumed by
+    ``manifolds/rough_contact/main_knn.py``.
+    """
     if isinstance(model, TangentialNNParameters):
         return model
-    values, source = _load_mapping(model, "tangential-NN")
-    layer_keys = tuple(
-        key
-        for index in range(len(_NN_LAYER_SIZES) - 1)
-        for key in (f"layer_{index}_weight", f"layer_{index}_bias")
-    )
-    _require_keys(
-        values,
-        _TANGENTIAL_REQUIRED_KEYS + layer_keys,
-        "tangential-NN",
-        source,
-    )
+    values, source = _load_mapping(model, "tangential-KNN")
+    _require_keys(values, _TANGENTIAL_REQUIRED_KEYS, "tangential-KNN", source)
 
-    expected_scalars = {
-        "format_version": 4,
-        "model_type": "neural_network_surface",
-        "precision": "float64",
-        "output_definition": "Ft",
-        "activation_name": "silu",
-        "weight_convention": "output = input @ weight + bias",
-        "layer_count": len(_NN_LAYER_SIZES) - 1,
-    }
-    for name, expected in expected_scalars.items():
-        actual = _scalar(values, name, source)
-        if actual != expected:
-            raise ValueError(
-                f"Incompatible tangential-NN {name} in {source}: "
-                f"{actual!r}; expected {expected!r}."
-            )
-
-    feature_order = tuple(np.asarray(values["input_feature_order"]).tolist())
-    if feature_order != ("U", "Fn"):
+    x_train = _numeric_array(values, "X_train", source, ndim=2)
+    if x_train.shape[0] == 0 or x_train.shape[1] != 2:
         raise ValueError(
-            f"Tangential-NN input_feature_order in {source} must be ('U', 'Fn')."
+            f"X_train in {source} must have nonempty shape (Ntrain, 2)."
         )
-    layer_sizes = tuple(np.asarray(values["layer_sizes"], dtype=np.int64).tolist())
-    if layer_sizes != _NN_LAYER_SIZES:
-        raise ValueError(
-            f"Tangential-NN layer_sizes in {source} must be {_NN_LAYER_SIZES}."
-        )
-    target_mode = str(_scalar(values, "target_mode", source))
-    if target_mode not in ("physical_standardized", "asinh_standardized"):
-        raise ValueError(
-            f"Unsupported tangential-NN target_mode {target_mode!r} in {source}."
-        )
+    z_train = _numeric_array(values, "Z_train", source, shape=(x_train.shape[0],))
 
-    positive_names = (
-        "s_U",
-        "s_Fn",
-        "s_Ft",
-        "U_transformed_std",
-        "Fn_transformed_std",
-        "target_std",
-        "utamp",
-    )
-    scalars = {name: _positive_scalar(values, name, source) for name in positive_names}
-    for name in ("U_transformed_mean", "Fn_transformed_mean", "target_mean"):
-        raw = np.asarray(values[name])
-        if raw.shape != () or not np.issubdtype(raw.dtype, np.number):
-            raise TypeError(
-                f"Model value {name!r} in {source} must be a numerical scalar."
-            )
-        value = np.float64(raw.item())
-        if not np.isfinite(value):
-            raise ValueError(f"Model value {name!r} in {source} must be finite.")
-        scalars[name] = value
-
-    weights = []
-    biases = []
-    for index, (fan_in, fan_out) in enumerate(
-        zip(_NN_LAYER_SIZES[:-1], _NN_LAYER_SIZES[1:])
+    n_neighbors_raw = np.asarray(values["n_neighbors"]).reshape(-1)
+    if n_neighbors_raw.size != 1 or not np.issubdtype(
+        n_neighbors_raw.dtype, np.integer
     ):
-        weights.append(
-            jnp.asarray(
-                _numeric_array(
-                    values,
-                    f"layer_{index}_weight",
-                    source,
-                    shape=(fan_in, fan_out),
-                )
-            )
+        raise TypeError(f"n_neighbors in {source} must be a single integer.")
+    n_neighbors = int(n_neighbors_raw[0])
+    if not 0 < n_neighbors <= x_train.shape[0]:
+        raise ValueError(
+            f"n_neighbors in {source} must satisfy 0 < n_neighbors <= Ntrain."
         )
-        biases.append(
-            jnp.asarray(
-                _numeric_array(
-                    values,
-                    f"layer_{index}_bias",
-                    source,
-                    shape=(fan_out,),
-                )
-            )
-        )
+
+    distance_weighted_raw = np.asarray(values["distance_weighted"]).reshape(-1)
+    if distance_weighted_raw.size != 1:
+        raise TypeError(f"distance_weighted in {source} must be a single value.")
+    distance_weighted = bool(distance_weighted_raw[0])
+
+    xy_mean = _numeric_array(values, "xy_mean", source, shape=(2,))
+    xy_scale = _numeric_array(values, "xy_scale", source, shape=(2,))
+    if np.any(xy_scale <= 0.0):
+        raise ValueError(f"xy_scale in {source} must be positive.")
+
+    z_mean = _numeric_array(values, "z_mean", source, shape=(1,))
+    z_scale = _numeric_array(values, "z_scale", source, shape=(1,))
+    if z_scale.item() <= 0.0:
+        raise ValueError(f"z_scale in {source} must be positive.")
+
+    scale_u = _positive_scalar(values, "scale_u", source)
+    scale_F = _positive_scalar(values, "scale_F", source)
 
     return TangentialNNParameters(
-        s_u=jnp.asarray(scalars["s_U"]),
-        s_fn=jnp.asarray(scalars["s_Fn"]),
-        s_ft=jnp.asarray(scalars["s_Ft"]),
-        u_mean=jnp.asarray(scalars["U_transformed_mean"]),
-        u_std=jnp.asarray(scalars["U_transformed_std"]),
-        fn_mean=jnp.asarray(scalars["Fn_transformed_mean"]),
-        fn_std=jnp.asarray(scalars["Fn_transformed_std"]),
-        target_mean=jnp.asarray(scalars["target_mean"]),
-        target_std=jnp.asarray(scalars["target_std"]),
-        target_is_asinh=jnp.asarray(target_mode == "asinh_standardized"),
-        utamp=jnp.asarray(scalars["utamp"]),
-        weights=tuple(weights),
-        biases=tuple(biases),
+        x_train=jnp.asarray(x_train),
+        z_train=jnp.asarray(z_train),
+        xy_mean=jnp.asarray(xy_mean),
+        xy_scale=jnp.asarray(xy_scale),
+        z_mean=jnp.asarray(z_mean.reshape(())),
+        z_scale=jnp.asarray(z_scale.reshape(())),
+        scale_u=jnp.asarray(scale_u),
+        scale_F=jnp.asarray(scale_F),
+        utamp=jnp.asarray(_TANGENTIAL_DISPLACEMENT_AMPLITUDE),
+        n_neighbors=n_neighbors,
+        distance_weighted=distance_weighted,
     )
 
 
@@ -403,35 +410,34 @@ def predict_normal_history(normal_displacement, parameters):
     )
 
 
-def _nn_forward(inputs, parameters):
-    values = inputs
-    final_index = len(parameters.weights) - 1
-    for index, (weight, bias) in enumerate(zip(parameters.weights, parameters.biases)):
-        values = values @ weight + bias
-        if index != final_index:
-            values = jax.nn.silu(values)
-    return values[..., 0]
-
-
-def _predict_nn_surface(displacement, normal_force, parameters):
+def _predict_knn_surface(displacement, normal_force, parameters):
+    """Evaluate the saved KNN surface, mirroring ``evaluate_jax`` in
+    ``manifolds/rough_contact/tangential_load_prediction_knn.py``."""
     normal_force = jnp.maximum(normal_force, 0.0)
-    transformed_u = jnp.arcsinh(displacement / parameters.s_u)
-    transformed_fn = jnp.log1p(normal_force / parameters.s_fn)
-    inputs = jnp.stack(
-        (
-            (transformed_u - parameters.u_mean) / parameters.u_std,
-            (transformed_fn - parameters.fn_mean) / parameters.fn_std,
-        ),
-        axis=-1,
+    scaled_displacement = displacement / parameters.scale_u
+    scaled_force = normal_force / parameters.scale_F
+    query = jnp.stack((scaled_displacement, scaled_force), axis=-1)
+    standardized_query = (query - parameters.xy_mean) / parameters.xy_scale
+
+    difference = standardized_query[..., None, :] - parameters.x_train[None, :, :]
+    squared_distance = jnp.sum(difference ** 2, axis=-1)
+
+    negative_squared_distance, neighbor_index = jax.lax.top_k(
+        -squared_distance, parameters.n_neighbors
     )
-    standardized_output = _nn_forward(inputs, parameters)
-    base_output = standardized_output * parameters.target_std + parameters.target_mean
-    return jax.lax.cond(
-        parameters.target_is_asinh,
-        lambda base: parameters.s_ft * jnp.sinh(base),
-        lambda base: base,
-        base_output,
-    )
+    neighbor_squared_distance = -negative_squared_distance
+    neighbor_targets = parameters.z_train[neighbor_index]
+
+    if parameters.distance_weighted:
+        neighbor_distance = jnp.sqrt(jnp.maximum(neighbor_squared_distance, 0.0))
+        weights = 1.0 / jnp.maximum(neighbor_distance, 1e-12)
+        weights = weights / jnp.sum(weights, axis=-1, keepdims=True)
+        standardized_output = jnp.sum(weights * neighbor_targets, axis=-1)
+    else:
+        standardized_output = jnp.mean(neighbor_targets, axis=-1)
+
+    output = standardized_output * parameters.z_scale + parameters.z_mean
+    return output * parameters.scale_F
 
 
 def _masked_minimum(values, mask):
@@ -446,7 +452,7 @@ def _masked_maximum(values, mask):
 
 @jax.jit
 def predict_tangential_history(tangential_displacement, normal_force, parameters):
-    """Evaluate the saved NN using the periodic trajectory symmetry in mainb."""
+    """Evaluate the saved KNN surface using the periodic trajectory symmetry in mainb."""
     displacement = jnp.asarray(tangential_displacement)
     normal_force = jnp.asarray(normal_force)
     if (
@@ -469,12 +475,12 @@ def predict_tangential_history(tangential_displacement, normal_force, parameters
 
     forward_min = _masked_minimum(forward_query, forward)
     forward_max = _masked_maximum(forward_query, forward)
-    forward_force = _predict_nn_surface(forward_query, normal_force, parameters)
+    forward_force = _predict_knn_surface(forward_query, normal_force, parameters)
     forward_offset = 0.5 * (
-        _predict_nn_surface(
+        _predict_knn_surface(
             jnp.full_like(forward_query, forward_min), normal_force, parameters
         )
-        + _predict_nn_surface(
+        + _predict_knn_surface(
             jnp.full_like(forward_query, forward_max), normal_force, parameters
         )
     )
@@ -482,12 +488,12 @@ def predict_tangential_history(tangential_displacement, normal_force, parameters
     reverse = ~forward
     reverse_min = _masked_minimum(reverse_query, reverse)
     reverse_max = _masked_maximum(reverse_query, reverse)
-    reverse_force = -_predict_nn_surface(reverse_query, normal_force, parameters)
+    reverse_force = -_predict_knn_surface(reverse_query, normal_force, parameters)
     reverse_offset = 0.5 * (
-        _predict_nn_surface(
+        _predict_knn_surface(
             jnp.full_like(reverse_query, reverse_min), normal_force, parameters
         )
-        + _predict_nn_surface(
+        + _predict_knn_surface(
             jnp.full_like(reverse_query, reverse_max), normal_force, parameters
         )
     )
