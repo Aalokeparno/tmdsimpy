@@ -245,7 +245,7 @@ class ElasticDryFriction2D(NonlinearForce):
         
         return F, dFdX
         
-    def aft(self, U, w, h, Nt=128, tol=1e-7):
+    def aft(self, U, w, h, Nt=128, tol=1e-7, calc_grad=True):
         """
         Implementation of the alternating frequency-time (AFT) method to 
         extract harmonic nonlinear force coefficients.
@@ -264,18 +264,24 @@ class ElasticDryFriction2D(NonlinearForce):
             The default is 128.
         tol : float, optional
             This argument is ignored, and is included for compatability of 
-            interface. 
+            interface.
             The default is 1e-7.
-        
+        calc_grad : bool, optional
+            Flag to calculate the gradients. If False, only `Fnl` is returned
+            (in a tuple).
+            The default is True.
+
         Returns
         -------
         Fnl : (N*Nhc,) numpy.ndarray
             Nonlinear hamonic force coefficients
         dFnldU : (N*Nhc,N*Nhc) numpy.ndarray
             Jacobian of `Fnl` with respect to `U`
+            Only returned if `calc_grad` is True.
         dFnldw : (N*Nhc,) numpy.ndarray
             Jacobian of `Fnl` with respect to `w`
-        
+            Only returned if `calc_grad` is True.
+
         Notes
         -----
         The tolerance `tol` is ignored because elastic dry friction converges
@@ -294,9 +300,10 @@ class ElasticDryFriction2D(NonlinearForce):
         # Memory Initialization 
         
         Fnl = np.zeros_like(U)
-        dFnldU = np.zeros((U.shape[0], U.shape[0]))
-        dFnldw = np.zeros_like(U)
-        
+        if calc_grad:
+            dFnldU = np.zeros((U.shape[0], U.shape[0]))
+            dFnldw = np.zeros_like(U)
+
         
         #########################
         # Transform to Local Coordinates
@@ -326,22 +333,26 @@ class ElasticDryFriction2D(NonlinearForce):
         
         pars = np.array([self.kt, self.kn, self.mu])
 
-        # # If no Grad is needed use:
-        # Flocal = _local_aft_jenkins(Uwlocal, pars, u0, tuple(h), Nt, u0h0)[0]
-        
-        # Case with gradient and local force
-        dFdUwlocal, Flocal = _local_aft_eldry_grad(Uwlocal, pars, u0, \
-                                                     tuple(h), Nt, u0h0)
-        
-        
+        if calc_grad:
+            # Case with gradient and local force
+            dFdUwlocal, Flocal = _local_aft_eldry_grad(Uwlocal, pars, u0, \
+                                                         tuple(h), Nt, u0h0)
+        else:
+            Flocal = _local_aft_eldry(Uwlocal, pars, u0, tuple(h), Nt, u0h0)[0]
+
+
         #########################
         # Convert AFT to Global Coordinates
-        
+
         # Reshape Flocal
         Flocal = jnp.reshape(Flocal, (Ndnl, Nhc), 'F')
-                
-        # Global coordinates        
+
+        # Global coordinates
         Fnl = np.reshape(self.T @ Flocal, (U.shape[0],), 'F')
+
+        if not calc_grad:
+            return (Fnl,)
+
         dFnldU = np.kron(np.eye(Nhc), self.T) @ dFdUwlocal[:, :-1] \
                                                 @ np.kron(np.eye(Nhc), self.Q)
         

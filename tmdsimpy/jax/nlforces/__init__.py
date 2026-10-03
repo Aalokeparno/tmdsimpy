@@ -10,6 +10,7 @@ tmdsimpy.nlforces :
 
 # Import nonlinear forces written with JAX
 from .elastic_dry_fric_2d import ElasticDryFriction2D
+from .elast_manifold import ElastManifoldFriction
 from .jenkins_element import JenkinsForce
 from .roughcontact.rough_contact import RoughContactFriction
 from .roughcontact.manifold import ManifoldFriction
@@ -19,6 +20,7 @@ from .vector_jenkins import VectorJenkins
 
 # things imported here that should be in __all__
 add_to_all = ['ElasticDryFriction2D',
+              'ElastManifoldFriction',
               'JenkinsForce',
               'RoughContactFriction',
               'ManifoldFriction',
@@ -26,6 +28,7 @@ add_to_all = ['ElasticDryFriction2D',
 
 # files that have imported contents here, so should not be in __all__
 remove_from_all = ['elastic_dry_fric_2d',
+                   'elast_manifold',
                    'jenkins_element',
                    'roughcontact',
                    'vector_jenkins']
